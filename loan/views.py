@@ -1,132 +1,191 @@
 from decimal import Decimal
 from django.db.models import Sum
 from django.shortcuts import get_object_or_404
+from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, NotFound
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.views import APIView
 
+from notifications.utils import notify_user
 from .models import DebtUser, DebtDocument, DocumentProduct
-from .serializers import DebtUserSerializer, DebtDocumentSerializer, DocumentProductSerializer
+from .serializers import (
+    DebtUserSerializer,
+    DebtDocumentSerializer,
+    DocumentProductSerializer,
+    DebtUserMessageSerializer,
+)
 
+User = get_user_model()
+
+
+# ----------------------------------------------------------------------
+# Helpers for resolving users and building payloads
+# ----------------------------------------------------------------------
+def _resolve_debtuser_platform_user(du: DebtUser) -> User | None:
+    """
+    1) Prefer an explicit FK (DebtUser.user).
+    2) Fallback to CustomUser by phone_number.
+    """
+    user = getattr(du, "user", None)
+    if user:
+        return user
+    try:
+        return User.objects.get(phone_number=du.phone_number)
+    except User.DoesNotExist:
+        return None
+
+
+def _debt_payload(doc: DebtDocument) -> dict:
+    """Build a compact JSON-serializable representation of a debt document."""
+    return {
+        "debtuser": str(doc.debtuser) if doc.debtuser else None,
+        "method": doc.method,
+        "currency": doc.currency,
+        "cash_amount": str(doc.cash_amount or Decimal("0")),
+        "product_amount": str(doc.product_amount or Decimal("0")),
+        "total_amount": str(doc.total_amount or Decimal("0")),
+        "date": doc.date.isoformat(),
+    }
+
+
+# ----------------------------------------------------------------------
+# Mixin to scope all actions by the store_id from the URL
+# ----------------------------------------------------------------------
 class StoreScopedMixin:
-    """
-    URL dan kelgan store_id bo'yicha barcha resurslarni scope qilish uchun mixin.
-    """
+    permission_classes = [IsAuthenticated]
+
     def get_store_id(self) -> int:
-        # config.platform.py dagi '<int:store_id>/' segmentidan keladi
-        return int(self.kwargs.get('store_id'))
+        return int(self.kwargs.get("store_id"))
 
     def ensure_same_store(self, obj_store_id: int):
-        # Xavfsizlik uchun noto'g'ri store bo'lsa 404 qaytaramiz (ma'lumot sizib chiqmasin)
         if obj_store_id != self.get_store_id():
-            raise NotFound()
+            raise NotFound("Object not found in this store.")
 
 
-
-
-
-class DebtUserViewSet(viewsets.ModelViewSet):
+# ----------------------------------------------------------------------
+# ViewSets
+# ----------------------------------------------------------------------
+class DebtUserViewSet(StoreScopedMixin, viewsets.ModelViewSet):
+    """
+    /platform/<store_id>/debt/debtors/
+    """
     serializer_class = DebtUserSerializer
 
     def get_queryset(self):
-        store_id = self.kwargs.get('store_id')
-        # Default: faqat faol (o‘chirilmagan) debtorlar
-        return DebtUser.objects.filter(store_id=store_id, is_deleted=False)
+        return DebtUser.objects.filter(store_id=self.get_store_id(), is_deleted=False)
 
-    def destroy(self, request, *args, **kwargs):
-        """DELETE -> trash (soft delete)"""
+    def perform_create(self, serializer):
+        serializer.save(store_id=self.get_store_id())
+
+    @action(detail=True, methods=["post"])
+    def soft_delete(self, request, store_id=None, pk=None):
         obj = self.get_object()
-        obj.soft_delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        self.ensure_same_store(obj.store_id)
+        obj.delete()
+        return Response({"status": "deleted"}, status=status.HTTP_204_NO_CONTENT)
 
-    @action(detail=False, methods=['get'], url_path='trash')
-    def trash(self, request, store_id=None):
-        """Trash ro‘yxati (o‘chirilganlar)"""
-        store_id = self.kwargs.get('store_id')
-        qs = DebtUser.objects.filter(store_id=store_id, is_deleted=True)
-        page = self.paginate_queryset(qs)
-        if page is not None:
-            ser = self.get_serializer(page, many=True)
-            return self.get_paginated_response(ser.data)
-        ser = self.get_serializer(qs, many=True)
-        return Response(ser.data, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=["post"])
     def restore(self, request, store_id=None, pk=None):
-        """Bitta debtorni trash’dan qaytarish"""
-        obj = self.get_object()  # bu trash’da ham topiladi (router detail)
-        obj.restore()
-        return Response({'status': 'restored'}, status=status.HTTP_200_OK)
-
-    @action(detail=False, methods=['post'], url_path='trash/restore')
-    def trash_restore(self, request, store_id=None):
-        """Bir nechta debtorni bulk tarzda qaytarish: {"ids":[1,2,3]}"""
-        store_id = self.kwargs.get('store_id')
-        ids = request.data.get('ids', [])
-        qs = DebtUser.objects.filter(store_id=store_id, id__in=ids, is_deleted=True)
-        cnt = 0
-        for u in qs:
-            u.restore()
-            cnt += 1
-        return Response({'restored': cnt}, status=status.HTTP_200_OK)
+        obj = self.get_object()
+        self.ensure_same_store(obj.store_id)
+        if hasattr(obj, "restore"):
+            obj.restore()
+        return Response({"status": "restored"}, status=status.HTTP_200_OK)
 
 
-class DebtDocumentViewSet(viewsets.ModelViewSet):
+class DebtDocumentViewSet(StoreScopedMixin, viewsets.ModelViewSet):
+    """
+    /platform/<store_id>/debt/debtors/{debtor_pk}/documents/
+    """
     serializer_class = DebtDocumentSerializer
 
     def get_store_id(self) -> int:
-        return int(self.kwargs.get('store_id'))
+        return int(self.kwargs.get("store_id"))
 
     def get_debtor_id(self) -> int | None:
-        v = self.kwargs.get('debtor_pk')
+        v = self.kwargs.get("debtor_pk")
         return int(v) if v is not None else None
 
     def get_queryset(self):
-        store_id = self.get_store_id()
-        debtor_id = self.get_debtor_id()
-        qs = DebtDocument.objects.filter(store_id=store_id)
-        if debtor_id:
-            qs = qs.filter(debtuser_id=debtor_id)
-
-        # Default: faqat o‘chirilmaganlar
-        show = self.request.query_params.get('show')
-        if show == 'deleted':
+        qs = DebtDocument.objects.filter(store_id=self.get_store_id())
+        debtor_pk = self.get_debtor_id()
+        if debtor_pk:
+            qs = qs.filter(debtuser_id=debtor_pk)
+        show = self.request.query_params.get("show")
+        if show == "deleted":
             return qs.filter(is_deleted=True)
-        if show == 'all':
+        if show == "all":
             return qs
         return qs.filter(is_deleted=False)
 
     def perform_create(self, serializer):
+        """
+        Ensure store_id and owner are set, and send notifications after commit.
+        """
         store_id = self.get_store_id()
         debtor_id = self.get_debtor_id()
+        owner = self.request.user
+
+        # Persist the document; set owner if not explicitly provided
+        save_kwargs = {"store_id": store_id, "owner": owner}
         if debtor_id:
-            serializer.save(store_id=store_id, debtuser_id=debtor_id)
-        else:
-            serializer.save(store_id=store_id)
+            save_kwargs["debtuser_id"] = debtor_id
+        document: DebtDocument = serializer.save(**save_kwargs)
+
+        # Immediately recompute debtor balance if this isn’t a mirror
+        if not document.is_mirror and document.debtuser:
+            document.debtuser.recalculate_balance()
+
+        # Schedule notifications after the transaction commits
+        def _send_notifications():
+            debtor_user = _resolve_debtuser_platform_user(document.debtuser)
+            payload = _debt_payload(document)
+
+            # Notify the actor (owner)
+            if document.method == "transfer":
+                verb_owner = f"Debt recorded for {document.debtuser}"
+            else:
+                verb_owner = f"Payment accepted from {document.debtuser}"
+            notify_user(owner, verb_owner, data=payload)
+
+            # Notify the debtor (platform user) if different
+            if debtor_user and debtor_user.id != owner.id:
+                if document.method == "transfer":
+                    verb_debtor = (
+                        f"Debt added from {owner}"
+                        if owner
+                        else "Debt recorded on your account"
+                    )
+                else:
+                    verb_debtor = "Your payment was recorded"
+                notify_user(debtor_user, verb_debtor, data=payload)
+
+        transaction.on_commit(_send_notifications)
 
     def perform_update(self, serializer):
-        # Debtor/store’ni URLdan tashqariga ko‘chirishga yo‘l qo‘ymaymiz
-        instance = self.get_object()
-        if instance.store_id != self.get_store_id():
-            raise PermissionDenied("Cannot move document to another store.")
-        if self.get_debtor_id() and instance.debtuser_id != self.get_debtor_id():
+        inst = self.get_object()
+        self.ensure_same_store(inst.store_id)
+        if self.get_debtor_id() and inst.debtuser_id != self.get_debtor_id():
             raise PermissionDenied("Cannot move document to another debtor.")
-        serializer.save()
+        doc: DebtDocument = serializer.save()
+        if not doc.is_mirror and doc.debtuser:
+            doc.debtuser.recalculate_balance()
 
-    # DELETE -> soft delete (trashga yuborish)
     def destroy(self, request, *args, **kwargs):
         doc = self.get_object()
         doc.soft_delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    # ---- TRASH (collection) ----
-    @action(detail=False, methods=['get'], url_path='trash')
+    @action(detail=False, methods=["get"], url_path="trash")
     def trash(self, request, store_id=None, debtor_pk=None):
         qs = DebtDocument.objects.filter(
             store_id=self.get_store_id(),
             debtuser_id=self.get_debtor_id(),
-            is_deleted=True
+            is_deleted=True,
         )
         page = self.paginate_queryset(qs)
         if page is not None:
@@ -135,35 +194,33 @@ class DebtDocumentViewSet(viewsets.ModelViewSet):
         ser = self.get_serializer(qs, many=True)
         return Response(ser.data, status=status.HTTP_200_OK)
 
-    # ---- RESTORE (detail) ----
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=["post"])
     def restore(self, request, store_id=None, debtor_pk=None, pk=None):
-        # get_object() default queryset’da is_deleted=False filtrlangan — o'chirilganni topolmaydi.
         doc = DebtDocument.objects.filter(
             pk=pk,
             store_id=self.get_store_id(),
-            debtuser_id=self.get_debtor_id()
+            debtuser_id=self.get_debtor_id(),
         ).first()
         if not doc:
             raise NotFound("Document not found.")
         doc.restore()
-        return Response({'status': 'restored'}, status=status.HTTP_200_OK)
+        return Response({"status": "restored"}, status=status.HTTP_200_OK)
 
-    # ---- BULK RESTORE (collection) ----
-    @action(detail=False, methods=['post'], url_path='trash/restore')
+    @action(detail=False, methods=["post"], url_path="trash/restore")
     def trash_restore(self, request, store_id=None, debtor_pk=None):
-        ids = request.data.get('ids', [])
+        ids = request.data.get("ids", [])
         qs = DebtDocument.objects.filter(
             store_id=self.get_store_id(),
             debtuser_id=self.get_debtor_id(),
             id__in=ids,
-            is_deleted=True
+            is_deleted=True,
         )
         cnt = 0
         for d in qs:
             d.restore()
             cnt += 1
-        return Response({'restored': cnt}, status=status.HTTP_200_OK)
+        return Response({"restored": cnt}, status=status.HTTP_200_OK)
+
 
 class DocumentProductViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     """
@@ -172,38 +229,37 @@ class DocumentProductViewSet(StoreScopedMixin, viewsets.ModelViewSet):
     serializer_class = DocumentProductSerializer
 
     def get_queryset(self):
-        qs = (DocumentProduct.objects
-              .select_related('document', 'product')
-              .filter(document__store_id=self.get_store_id()))
-        debtor_pk = self.kwargs.get('debtor_pk')
-        document_pk = self.kwargs.get('document_pk')
+        qs = (
+            DocumentProduct.objects.select_related("document", "product")
+            .filter(document__store_id=self.get_store_id())
+        )
+        debtor_pk = self.kwargs.get("debtor_pk")
+        document_pk = self.kwargs.get("document_pk")
         if debtor_pk:
             qs = qs.filter(document__debtuser_id=debtor_pk)
         if document_pk:
             qs = qs.filter(document_id=document_pk)
         return qs
 
-    # ---- Totallarni qayta hisoblash yordamchi ----
+    # --- Helper to recompute totals and debtor balance ---
     def _recompute_document_totals(self, doc: DebtDocument):
-        total_products = doc.products.aggregate(s=Sum('amount'))['s'] or Decimal('0.00')
-        new_total = (doc.cash_amount or Decimal('0.00')) + total_products
-        # Yon-efektlarsiz yangilash
+        total_products = doc.products.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        new_total = (doc.cash_amount or Decimal("0.00")) + total_products
         DebtDocument.objects.filter(pk=doc.pk).update(
-            product_amount=total_products,
-            total_amount=new_total
+            product_amount=total_products, total_amount=new_total
         )
-        # Debtor balansini ham yangilaymiz (mirror/soft-delete emas)
         if doc.debtuser_id and not doc.is_mirror and not doc.is_deleted:
             doc.debtuser.recalculate_balance()
 
     def perform_create(self, serializer):
-        document_pk = self.kwargs.get('document_pk')
-        doc = get_object_or_404(DebtDocument.objects.select_related('debtuser'), pk=document_pk)
+        doc = get_object_or_404(
+            DebtDocument.objects.select_related("debtuser"),
+            pk=self.kwargs.get("document_pk"),
+        )
         self.ensure_same_store(doc.store_id)
-        if self.kwargs.get('debtor_pk') and doc.debtuser_id != int(self.kwargs['debtor_pk']):
+        if self.kwargs.get("debtor_pk") and doc.debtuser_id != int(self.kwargs["debtor_pk"]):
             raise PermissionDenied("Document does not belong to this debtor.")
         obj = serializer.save(document=doc)
-        # Birinchi saqlashdayoq totals yangilansin
         self._recompute_document_totals(doc)
         return obj
 
@@ -211,15 +267,60 @@ class DocumentProductViewSet(StoreScopedMixin, viewsets.ModelViewSet):
         instance = self.get_object()
         self.ensure_same_store(instance.document.store_id)
         obj = serializer.save()
-        # Yangilaganda ham totals yangilansin
         self._recompute_document_totals(instance.document)
         return obj
 
     def perform_destroy(self, instance):
-        # DRF 3.15+ da perform_destroy(self, instance) imzosi; call chain:
-        # self.perform_destroy(instance) -> instance.delete()
         doc = instance.document
         self.ensure_same_store(doc.store_id)
-        super().perform_destroy(instance)  # actually deletes
-        # O'chirilgandan keyin totals yangilash
+        super().perform_destroy(instance)
         self._recompute_document_totals(doc)
+
+
+# ----------------------------------------------------------------------
+# Manual message API
+# ----------------------------------------------------------------------
+class DebtUserMessageView(StoreScopedMixin, APIView):
+    """
+    POST /platform/<store_id>/debt/debtors/send-message/
+    {
+      "phone_number": "+998901234567",
+      "title":        "Payment Reminder",
+      "description":  "Your debt of 100 USD is due tomorrow.",
+      "action":       "copy"
+    }
+    Sends an in-app notification to the debtor’s platform user.
+    """
+
+    def post(self, request, store_id=None):
+        serializer = DebtUserMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        phone = serializer.validated_data["phone_number"]
+        title = serializer.validated_data["title"]
+        description = serializer.validated_data["description"]
+        action = serializer.validated_data["action"]
+
+        du = DebtUser.objects.filter(
+            store_id=self.get_store_id(),
+            phone_number=phone,
+            is_deleted=False,
+        ).first()
+        if du is None:
+            return Response(
+                {"detail": "DebtUser not found in this store."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        recipient = _resolve_debtuser_platform_user(du)
+        if recipient is None:
+            return Response(
+                {"detail": "No platform user with that phone number."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        notify_user(
+            recipient,
+            verb=title,
+            data={"description": description, "action": action},
+        )
+        return Response({"status": "message sent"}, status=status.HTTP_201_CREATED)

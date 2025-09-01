@@ -16,6 +16,7 @@ urlpatterns = [
         path('refunds/', include('refund.urls')),
         path('system/', include('systems.urls')),
         path('expense/', include('expense.urls')),
-        path('debt/', include('loan.urls'))
+        path('debt/', include('loan.urls')),
+        path('debt-offer/', include('loan.urls_offers'))
     ])),
 ]

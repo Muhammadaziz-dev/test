@@ -1,7 +1,7 @@
 from django.contrib import admin, messages
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
-from .models import DebtUser, DebtDocument, DocumentProduct
+from .models import DebtUser, DebtDocument, DocumentProduct, DebtImportOffer
 from django.db.models import Sum
 
 class DocumentProductInline(admin.TabularInline):
@@ -213,3 +213,9 @@ class DocumentProductAdmin(admin.ModelAdmin):
         if obj and obj.document and getattr(obj.document, 'is_deleted', False):
             return False
         return super().has_delete_permission(request, obj)
+
+@admin.register(DebtImportOffer)
+class DebtImportOfferAdmin(admin.ModelAdmin):
+    list_display = ("id", "debtor_user", "status", "created_by", "applied_store", "applied_document", "created_at", "expires_at")
+    search_fields = ("debtor_user__username", "debtor_user__phone_number")
+    list_filter = ("status", "created_at")

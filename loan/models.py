@@ -7,6 +7,9 @@ from systems.models import StockTransfer
 from cashbox.models import CashTransaction
 from django.core.exceptions import ValidationError
 from django.db.models import Q
+from django.conf import settings
+from store.models import Store
+
 
 class SoftDeleteMixin(models.Model):
     is_deleted = models.BooleanField(default=False, db_index=True)
@@ -448,3 +451,104 @@ class DocumentProduct(models.Model):
             super().delete(*args, **kwargs)
             # summalarni va kassani sinxronlash uchun documentni saqlab qo'yamiz
             doc.save(update_fields=['product_amount', 'total_amount'])
+
+
+class DebtImportOffer(models.Model):
+    class Status(models.TextChoices):
+        PENDING  = "pending",  "Pending"
+        ACCEPTED = "accepted", "Accepted"
+        REJECTED = "rejected", "Rejected"
+        APPLIED  = "applied",  "Applied"
+        EXPIRED  = "expired",  "Expired"
+
+    debtor_user   = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="debt_offers")
+    created_by    = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="created_debt_offers")
+    status        = models.CharField(max_length=16, choices=Status.choices, default=Status.PENDING)
+    payload       = models.JSONField(default=dict)   # {amount, currency, phone_number, creditor_name, source_store_id, external_id, note, method?}
+    idempotency_key = models.CharField(max_length=64, blank=True, null=True, unique=True)
+
+    applied_store    = models.ForeignKey(Store, on_delete=models.SET_NULL, null=True, blank=True, related_name="applied_debt_offers")
+    applied_document = models.ForeignKey(DebtDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name="from_offers")
+
+    created_at    = models.DateTimeField(auto_now_add=True)
+    expires_at    = models.DateTimeField(null=True, blank=True)
+    decided_at    = models.DateTimeField(null=True, blank=True)
+    decided_by    = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="decided_debt_offers")
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Offer #{self.pk} → {self.debtor_user} [{self.status}]"
+
+    # ---- domain helpers ----
+    def is_pending(self) -> bool:
+        if self.status != self.Status.PENDING:
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        return True
+
+    def mark(self, status: str, by=None):
+        self.status = status
+        self.decided_at = timezone.now()
+        if by:
+            self.decided_by = by
+        self.save(update_fields=["status", "decided_at", "decided_by"])
+
+    def apply_to_store(self, store: Store, actor) -> DebtDocument:
+        """
+        Materialize the debt into the chosen store.
+        - Ensures/creates DebtUser for the counterparty (creditor) in the store
+        - Creates a DebtDocument (default: method='transfer')
+        - Recalculates balances
+        """
+        if not self.is_pending() and self.status != self.Status.ACCEPTED:
+            # Idempotent return if already applied
+            if self.status == self.Status.APPLIED and self.applied_document_id:
+                return self.applied_document
+            raise ValueError("Offer is not pending/accepted.")
+
+        amount   = self.payload.get("amount")
+        currency = self.payload.get("currency", "USD")
+        phone    = self.payload.get("phone_number")  # creditor/customer phone (counterparty in that store)
+        name     = self.payload.get("creditor_name", "")
+        method   = self.payload.get("method") or "transfer"  # keep consistent with your math transferred-accepted
+
+        if not amount:
+            raise ValueError("Offer payload missing 'amount'")
+
+        # 1) Ensure a DebtUser for this counterparty in the chosen store
+        du, _ = DebtUser.objects.get_or_create(
+            store=store,
+            phone_number=phone or f"unknown-{self.pk}",
+            defaults={
+                "first_name": name or "Unknown",
+                "last_name": "",
+                "currency": currency,
+            }
+        )
+
+        # 2) Create the debt document in that store
+        doc = DebtDocument.objects.create(
+            debtuser=du,
+            owner=actor,                      # who accepted the offer
+            method=method,                    # usually 'transfer' for “we gave debt”
+            currency=currency,
+            cash_amount=amount,
+            product_amount=0,
+            total_amount=amount,
+            is_mirror=False,
+            date=timezone.now(),
+        )
+
+        # 3) Recalculate balance
+        du.recalculate_balance()
+
+        # 4) Link + mark applied
+        self.applied_store = store
+        self.applied_document = doc
+        self.mark(self.Status.APPLIED, by=actor)
+        self.save(update_fields=["applied_store", "applied_document"])
+        return doc
+

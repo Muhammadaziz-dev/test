@@ -1,22 +1,36 @@
 # loan/urls.py
+from django.urls import path, include, re_path
 from rest_framework_nested.routers import SimpleRouter, NestedSimpleRouter
-from .views import DebtUserViewSet, DebtDocumentViewSet, DocumentProductViewSet
 
-# Root: /platform/<store_id>/debt/
-# 1) /debtors/
-router = SimpleRouter()
-router.register(r'debtors', DebtUserViewSet, basename='debtors')
+from .views import (
+    DebtUserViewSet,
+    DebtDocumentViewSet,
+    DocumentProductViewSet,
+    DebtUserMessageView,
+)
 
-# 2) /debtors/{debtor_pk}/documents/
-debtors_router = NestedSimpleRouter(router, r'debtors', lookup='debtor')
-debtors_router.register(r'documents', DebtDocumentViewSet, basename='debtor-documents')
+# Root: /platform/<store_id>/debt/debtors/
+root_router = SimpleRouter()
+root_router.register(r"debtors", DebtUserViewSet, basename="debtors")
 
-# 3) /debtors/{debtor_pk}/documents/{document_pk}/products/
-documents_router = NestedSimpleRouter(debtors_router, r'documents', lookup='document')
-documents_router.register(r'products', DocumentProductViewSet, basename='document-products')
+# /debtors/{debtor_pk}/documents/
+debtor_router = NestedSimpleRouter(root_router, r"debtors", lookup="debtor")
+debtor_router.register(r"documents", DebtDocumentViewSet, basename="debtor-documents")
+
+# /debtors/{debtor_pk}/documents/{document_pk}/products/
+documents_router = NestedSimpleRouter(debtor_router, r"documents", lookup="document")
+documents_router.register(
+    r"products", DocumentProductViewSet, basename="document-products"
+)
 
 urlpatterns = [
-    *router.urls,
-    *debtors_router.urls,
+    *root_router.urls,
+    *debtor_router.urls,
     *documents_router.urls,
+    # Manual message endpoint
+    re_path(
+        r"^debtors/send-message/$",
+        DebtUserMessageView.as_view(),
+        name="debtuser-send-message",
+    ),
 ]

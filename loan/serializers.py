@@ -1,5 +1,42 @@
 from rest_framework import serializers
-from .models import DebtUser, DebtDocument, DocumentProduct
+from .models import DebtUser, DebtDocument, DocumentProduct, DebtImportOffer
+
+
+class DebtImportOfferCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DebtImportOffer
+        fields = ["id", "debtor_user", "payload", "expires_at", "idempotency_key"]
+        read_only_fields = ["id"]
+
+    def validate(self, attrs):
+        payload = attrs.get("payload") or {}
+        if "amount" not in payload:
+            raise serializers.ValidationError({"payload.amount": "required"})
+        return attrs
+
+
+class DebtImportOfferSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DebtImportOffer
+        fields = "__all__"
+
+
+class DebtImportOfferAcceptSerializer(serializers.Serializer):
+    store_id = serializers.IntegerField()
+
+
+class DebtImportOfferRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+class DebtUserMessageSerializer(serializers.Serializer):
+    phone_number = serializers.CharField(
+        max_length=15, help_text="DebtUser’s phone number"
+    )
+    title = serializers.CharField(max_length=255, help_text="Notification title")
+    description = serializers.CharField(help_text="Message body")
+    action = serializers.CharField(
+        max_length=50, help_text="Client-side action (e.g. 'copy', 'share')"
+    )
 
 
 class DocumentProductSerializer(serializers.ModelSerializer):
